@@ -6,50 +6,43 @@ from bs4 import BeautifulSoup
 from concurrent.futures import ThreadPoolExecutor
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-# Check for GPU support
-device = "cuda" if torch.cuda.is_available() else "cpu"
-print(f"Running on: {device.upper()}")
-
 # Constants
-MODEL_NAME = "deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B"
+SUMMARIZER_MODEL = "deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B"
 HEADERS = {"User-Agent": "Mozilla/5.0"}
 MAX_CASE_TEXT_LENGTH = 9500
 MAX_CONCURRENT_REQUESTS = 100
 
-executor = ThreadPoolExecutor(max_workers=10)  # Increased workers for speed
+# Load Hugging Face Model
+device = "cuda" if torch.cuda.is_available() else "cpu"
+tokenizer = AutoTokenizer.from_pretrained(SUMMARIZER_MODEL)
+model = AutoModelForCausalLM.from_pretrained(SUMMARIZER_MODEL).to(device)
+
+# Increase parallel processing for speed
+executor = ThreadPoolExecutor(max_workers=10)
 semaphore = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
 
-# Load model and tokenizer (download once and use locally)
-@st.cache_resource
-def load_model():
-    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
-    model = AutoModelForCausalLM.from_pretrained(MODEL_NAME, torch_dtype=torch.float16).to(device)
-    return tokenizer, model
-
-tokenizer, model = load_model()
-
 async def fetch_url(url, client):
-    """Fetches a URL using a shared async client with controlled concurrency."""
+    """Fetches a URL asynchronously with controlled concurrency."""
     async with semaphore:
         response = await client.get(url, headers=HEADERS)
         return response
 
 async def search_indiankanoon(query, client):
-    """Search Indian Kanoon for cases based on a query using persistent client."""
+    """Search Indian Kanoon for cases based on a query."""
     search_url = f"https://indiankanoon.org/search/?formInput={query}"
     response = await fetch_url(search_url, client)
 
     if response.status_code != 200:
         return []
 
-    soup = BeautifulSoup(response.text, "lxml")  # Using faster lxml parser
+    soup = BeautifulSoup(response.text, "lxml")  # Faster parser
     return [
         {"title": link.text.strip(), "url": "https://indiankanoon.org" + link["href"]}
         for link in soup.select(".result_title a")[:10]
     ]
 
 async def scrape_case(url, client):
-    """Scrapes case details from Indian Kanoon using persistent client."""
+    """Scrapes case details from Indian Kanoon."""
     response = await fetch_url(url, client)
 
     if response.status_code != 200:
@@ -66,7 +59,7 @@ async def scrape_case(url, client):
     return {"title": "Unknown", "text": case_text, "url": url}
 
 def summarize_text(text):
-    """Summarizes case text using DeepSeek model locally."""
+    """Summarizes case text using DeepSeek AI model."""
     prompt = f"""
     You are an Indian legal AI assistant. Summarize the following court case with high accuracy, using only the provided text.
     Do NOT add assumptions or external knowledge on your own.
@@ -84,15 +77,18 @@ def summarize_text(text):
     Case Text: {text}...
     """
 
-    inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=2048).to(device)
-    
-    with torch.no_grad():
-        output = model.generate(**inputs, max_length=500, temperature=0.7)
+    try:
+        inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=4096).to(device)
+        output = model.generate(**inputs, max_new_tokens=512, do_sample=True, temperature=0.7, top_p=0.9)
 
-    return tokenizer.decode(output[0], skip_special_tokens=True)
+        summary = tokenizer.decode(output[0], skip_special_tokens=True)
+        return summary.split("</think>", 1)[-1].strip()
+
+    except Exception as e:
+        return f"Error in summarization: {str(e)}"
 
 async def process_case(case, client):
-    """Processes a single case asynchronously without redundant fetching."""
+    """Processes a single case asynchronously."""
     case_data = await scrape_case(case["url"], client)
 
     if not case_data["text"] or "Failed to fetch" in case_data["text"]:
@@ -103,7 +99,7 @@ async def process_case(case, client):
     return {"title": case["title"], "summary": summary}
 
 async def fetch_and_process_cases(query):
-    """Fetches case references and summarizes them asynchronously using a shared HTTP client."""
+    """Fetches case references and summarizes them asynchronously."""
     async with httpx.AsyncClient(timeout=10) as client:
         cases = await search_indiankanoon(query, client)
         if not cases:
